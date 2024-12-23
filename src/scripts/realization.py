@@ -1,10 +1,9 @@
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as f
-from pyspark.sql.functions import col, lit
+from pyspark.sql.functions import col
 from pyspark.sql.types import StructType, StructField, StringType, LongType
 from kafka import KafkaProducer
-import time
 
 TOPIC_NAME_IN = 'a.navaro_in'
 TOPIC_NAME_OUT = 'a.navaro_out'
@@ -69,14 +68,6 @@ spark = SparkSession.builder \
     .config("spark.jars.packages", spark_jars_packages) \
     .getOrCreate()
 
-# читаем из топика Kafka сообщения с акциями от ресторанов 
-restaurant_read_stream_df = spark.readStream \
-    .format('kafka') \
-    .option('kafka.bootstrap.servers', 'rc1b-2erh7b35n4j4v869.mdb.yandexcloud.net:9091') \
-    .options(**kafka_security_options)\
-    .option('subscribe', TOPIC_NAME_IN) \
-    .load()
-
 # определяем схему входного сообщения для json
 incomming_message_schema = StructType([
     StructField("restaurant_id", StringType(), nullable=False),  # UUID ресторана
@@ -89,10 +80,6 @@ incomming_message_schema = StructType([
     StructField("datetime_created", LongType(), nullable=False)  # время создания кампании
 ])
 
-# определяем текущее время в UTC в миллисекундах, затем округляем до секунд
-current_timestamp_utc = int(round(time.time())) 
-
-
 # читаем и десериализуем из value сообщения json и фильтруем по времени старта и окончания акции
 filtered_read_stream_df = (spark.readStream.format('kafka')
           .option('kafka.bootstrap.servers', 'rc1b-2erh7b35n4j4v869.mdb.yandexcloud.net:9091')
@@ -103,7 +90,8 @@ filtered_read_stream_df = (spark.readStream.format('kafka')
           .withColumn('value', f.col('value').cast(StringType()))
           .withColumn('event', f.from_json(f.col('value'), incomming_message_schema))
           .selectExpr('event.*')
-          .filter((col("adv_campaign_datetime_start") <= lit(current_timestamp_utc)) & (col("adv_campaign_datetime_end") >= lit(current_timestamp_utc)))
+          .withColumn('trigger_datetime_created', f.round(f.unix_timestamp(f.current_timestamp())))
+          .filter((col("adv_campaign_datetime_start") <= col("trigger_datetime_created")) & (col("adv_campaign_datetime_end") >= col('trigger_datetime_created')))
           )
 
 # вычитываем всех пользователей с подпиской на рестораны
@@ -120,7 +108,6 @@ subscribers_restaurant_df = subscribers_restaurant_df.withColumnRenamed("restaur
 
 # джойним данные из сообщения Kafka с пользователями подписки по restaurant_id (uuid). Добавляем время создания события.
 result_df = (filtered_read_stream_df.join(subscribers_restaurant_df, filtered_read_stream_df.restaurant_id == subscribers_restaurant_df.subscriber_restaurant_id)
-             .withColumn('trigger_datetime_created', lit(current_timestamp_utc))
              .withColumn('client_id', subscribers_restaurant_df.client_id)
              .select('restaurant_id','adv_campaign_id','adv_campaign_content','adv_campaign_owner','adv_campaign_owner_contact','adv_campaign_datetime_start','adv_campaign_datetime_end','client_id', 'datetime_created','trigger_datetime_created')
              )
